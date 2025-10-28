@@ -1,0 +1,3 @@
+.env
+workspace_usage/users/date=2025-10-16/part-00000.parquet
+workspace_usage/gpts/date=2025-10-16/part-00000.parquet

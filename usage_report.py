@@ -73,6 +73,36 @@ REPORT_SCHEMA = pa.schema([
     ("last_day_active", pa.string()),
 ])
 
+GPT_REPORT_COLUMNS = [
+    "cadence","period_start","period_end","account_id","gpt_id","gpt_name",
+    "config_type","gpt_description","gpt_url","gpt_creator_public_id",
+    "gpt_creator_email","is_active","first_day_active_in_period",
+    "last_day_active_in_period","messages_workspace",
+    "unique_messagers_workspace"
+]
+
+GPT_REPORT_SCHEMA = pa.schema([
+    ("cadence", pa.string()),
+    ("period_start", pa.string()),
+    ("period_end", pa.string()),
+    ("account_id", pa.string()),
+    ("gpt_id", pa.string()),
+    ("gpt_name", pa.string()),
+    ("config_type", pa.string()),
+    ("gpt_description", pa.string()),
+    ("gpt_url", pa.string()),
+    ("gpt_creator_public_id", pa.string()),
+    ("gpt_creator_email", pa.string()),
+    ("is_active", pa.bool_()),
+    ("first_day_active_in_period", pa.string()),
+    ("last_day_active_in_period", pa.string()),
+    ("messages_workspace", pa.int64()),
+    ("unique_messagers_workspace", pa.int64()),
+])
+
+USERS_SUBDIR = "users"
+GPTS_SUBDIR = "gpts"
+
 # Safety defaults
 CONVERSATION_LIMIT = 500   # max allowed by API (see spec)
 USERS_LIMIT        = 200   # API default (spec)
@@ -201,6 +231,21 @@ def iter_projects(workspace_id: str) -> Iterable[dict]:
             break
         after = data.get("last_id")
 
+def iter_gpts(workspace_id: str) -> Iterable[dict]:
+    """Yield GPT dicts (live GPTs)."""
+    url = f"{BASE_URL}/compliance/workspaces/{workspace_id}/gpts"
+    after = None
+    while True:
+        params = {"limit": 200}
+        if after:
+            params["after"] = after
+        data = http_get("gpts_list", url, params)
+        for g in data.get("data", []):
+            yield g
+        if not data.get("has_more"):
+            break
+        after = data.get("last_id")
+
 def iter_conversations_yday(workspace_id: str, start_ts: int, user_ids: Optional[List[str]] = None) -> Iterable[dict]:
     """
     Yield conversations updated since start_ts (yesterday 00:00:00 UTC).
@@ -270,6 +315,30 @@ def build_daily_report(target_date: Optional[date_cls] = None):
     active_user_ids = [uid for uid, info in users_index.items() if info.get("status") == "active"]
     logger.info("Discovered %d users (%d active)", total_users, len(active_user_ids))
 
+    # Map gpt_id -> GPT metadata
+    gpt_index: Dict[str, dict] = {}
+    logger.info("Fetching workspace GPTs...")
+    with progress_bar(iter_gpts(WORKSPACE_ID), "GPTs", unit="gpt") as gpt_iter:
+        for g in gpt_iter:
+            gpt_id = g.get("id")
+            if not gpt_id:
+                continue
+            latest_entry = {}
+            latest_config = g.get("latest_config") or {}
+            if isinstance(latest_config, dict):
+                configs = latest_config.get("data") or []
+                if configs:
+                    latest_entry = configs[0]
+            gpt_index[gpt_id] = {
+                "id": gpt_id,
+                "name": latest_entry.get("name") or g.get("name") or "",
+                "description": latest_entry.get("description") or g.get("description") or "",
+                "url": "",
+                "owner_id": g.get("owner_id") or "",
+                "owner_email": g.get("owner_email") or "",
+                "config_type": "Live",
+            }
+
     # Initialize counters (per user)
     counters = {}
     def ensure_user(uid: str):
@@ -293,6 +362,29 @@ def build_daily_report(target_date: Optional[date_cls] = None):
                 "first_active_ts": None,
                 "last_active_ts": None,
             }
+
+    gpt_counters: Dict[str, dict] = {}
+    def ensure_gpt(gid: str):
+        if gid not in gpt_counters:
+            info = gpt_index.get(gid, {
+                "id": gid,
+                "name": "",
+                "description": "",
+                "url": "",
+                "owner_id": "",
+                "owner_email": "",
+                "config_type": "",
+            })
+            gpt_counters[gid] = {
+                "info": info,
+                "messages": 0,
+                "unique_users": set(),
+                "first_active_ts": None,
+                "last_active_ts": None,
+            }
+
+    for gid in gpt_index:
+        ensure_gpt(gid)
 
     for uid in active_user_ids:
         ensure_user(uid)
@@ -373,6 +465,14 @@ def build_daily_report(target_date: Optional[date_cls] = None):
                             user_counter["gpts_set"].add(gpt_id)
                             gpt_map = user_counter["gpt_messages_map"]
                             gpt_map[gpt_id] = gpt_map.get(gpt_id, 0) + 1
+                            ensure_gpt(gpt_id)
+                            gpt_counter = gpt_counters[gpt_id]
+                            gpt_counter["messages"] += 1
+                            gpt_counter["unique_users"].add(conv_user_id)
+                            if gpt_counter["first_active_ts"] is None or ts_val < gpt_counter["first_active_ts"]:
+                                gpt_counter["first_active_ts"] = ts_val
+                            if gpt_counter["last_active_ts"] is None or ts_val > gpt_counter["last_active_ts"]:
+                                gpt_counter["last_active_ts"] = ts_val
 
                         project_id = msg.get("project_id")
                         if project_id:
@@ -556,16 +656,106 @@ def build_daily_report(target_date: Optional[date_cls] = None):
         column_arrays.append(array)
     table = pa.Table.from_arrays(column_arrays, schema=REPORT_SCHEMA)
 
-    partition_dir = os.path.join(
+    user_partition_dir = os.path.join(
         OUTPUT_DIR,
+        USERS_SUBDIR,
         f"date={start_str}",
     )
-    os.makedirs(partition_dir, exist_ok=True)
-    out_path = os.path.join(partition_dir, "part-00000.parquet")
-    logger.info("Writing Parquet dataset to %s", out_path)
-    pq.write_table(table, out_path, use_dictionary=False)
+    os.makedirs(user_partition_dir, exist_ok=True)
+    user_out_path = os.path.join(user_partition_dir, "part-00000.parquet")
+    logger.info("Writing user Parquet dataset to %s", user_out_path)
+    pq.write_table(table, user_out_path, use_dictionary=False)
 
-    print(out_path)
+    # Build GPT usage rows
+    gpt_rows = []
+    for gid, counter in gpt_counters.items():
+        info = counter.get("info") or {}
+        first_active_ts = counter.get("first_active_ts")
+        last_active_ts = counter.get("last_active_ts")
+        first_active_date = (
+            datetime.fromtimestamp(first_active_ts, tz=timezone.utc).date().isoformat()
+            if first_active_ts is not None else ""
+        )
+        last_active_date = (
+            datetime.fromtimestamp(last_active_ts, tz=timezone.utc).date().isoformat()
+            if last_active_ts is not None else ""
+        )
+        messages_workspace = int(counter.get("messages", 0))
+        unique_messagers_workspace = len(counter.get("unique_users", set()))
+        is_active_gpt = messages_workspace > 0
+        row = {
+            "cadence": "Daily",
+            "period_start": start_str,
+            "period_end": end_str,
+            "account_id": WORKSPACE_ID,
+            "gpt_id": info.get("id", gid),
+            "gpt_name": info.get("name", ""),
+            "config_type": info.get("config_type", ""),
+            "gpt_description": info.get("description", ""),
+            "gpt_url": info.get("url", ""),
+            "gpt_creator_public_id": info.get("owner_id", ""),
+            "gpt_creator_email": info.get("owner_email", ""),
+            "is_active": is_active_gpt,
+            "first_day_active_in_period": first_active_date,
+            "last_day_active_in_period": last_active_date,
+            "messages_workspace": messages_workspace,
+            "unique_messagers_workspace": unique_messagers_workspace,
+        }
+        gpt_rows.append(row)
+
+    # Include GPTs with metadata but no counter (should already exist, but safeguard)
+    for gid, info in gpt_index.items():
+        if gid not in gpt_counters:
+            row = {
+                "cadence": "Daily",
+                "period_start": start_str,
+                "period_end": end_str,
+                "account_id": WORKSPACE_ID,
+                "gpt_id": info.get("id", gid),
+                "gpt_name": info.get("name", ""),
+                "config_type": info.get("config_type", ""),
+                "gpt_description": info.get("description", ""),
+                "gpt_url": info.get("url", ""),
+                "gpt_creator_public_id": info.get("owner_id", ""),
+                "gpt_creator_email": info.get("owner_email", ""),
+                "is_active": False,
+                "first_day_active_in_period": "",
+                "last_day_active_in_period": "",
+                "messages_workspace": 0,
+                "unique_messagers_workspace": 0,
+            }
+            gpt_rows.append(row)
+
+    # Deterministic ordering by gpt_id
+    gpt_rows = sorted(gpt_rows, key=lambda r: r["gpt_id"])
+    logger.info("GPT dataset contains %d rows", len(gpt_rows))
+
+    if gpt_rows:
+        ordered_gpt_rows = [{col: r.get(col) for col in GPT_REPORT_COLUMNS} for r in gpt_rows]
+        gpt_arrays = []
+        for field in GPT_REPORT_SCHEMA:
+            values = [row[field.name] for row in ordered_gpt_rows]
+            array = pa.array(values, type=field.type, from_pandas=True)
+            gpt_arrays.append(array)
+        gpt_table = pa.Table.from_arrays(gpt_arrays, schema=GPT_REPORT_SCHEMA)
+    else:
+        gpt_table = pa.Table.from_arrays(
+            [pa.array([], type=field.type) for field in GPT_REPORT_SCHEMA],
+            schema=GPT_REPORT_SCHEMA,
+        )
+
+    gpt_partition_dir = os.path.join(
+        OUTPUT_DIR,
+        GPTS_SUBDIR,
+        f"date={start_str}",
+    )
+    os.makedirs(gpt_partition_dir, exist_ok=True)
+    gpt_out_path = os.path.join(gpt_partition_dir, "part-00000.parquet")
+    logger.info("Writing GPT Parquet dataset to %s", gpt_out_path)
+    pq.write_table(gpt_table, gpt_out_path, use_dictionary=False)
+
+    print(user_out_path)
+    print(gpt_out_path)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate daily compliance usage report Parquet dataset.")
