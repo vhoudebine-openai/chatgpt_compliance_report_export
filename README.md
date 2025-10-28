@@ -1,12 +1,12 @@
 # Compliance Report Export
 
-Automates the daily export of ChatGPT Enterprise Compliance API usage data into a partitioned Parquet dataset that can be consumed by downstream analytics tooling.
+Automates the daily export of ChatGPT Enterprise Compliance API usage data into partitioned Parquet datasets that can be consumed by downstream analytics tooling.
 
 ## Features
 - Pulls conversations, users, and projects for a workspace and aggregates user-level metrics.
 - Filters to active users and counts only messages within the requested UTC day.
 - Produces JSON map columns for model, GPT, tool, and project usage as defined by the compliance reporting spec.
-- Writes results to `./date=YYYY-MM-DD/part-00000.parquet` for easy ingestion into data warehouses.
+- Writes separate user and GPT usage datasets under partitioned `date=YYYY-MM-DD` directories for easy ingestion into data warehouses.
 - Respects Compliance API pagination by batching up to 100 active users per request when fetching conversations, preventing `since_timestamp`/`after` conflicts and keeping within per-endpoint rate limits.
 
 ## Requirements
@@ -44,12 +44,16 @@ python usage_report.py --date 2025-10-21
 If `--date` is omitted, the script defaults to yesterday’s UTC day.
 
 ## Output
-The script writes a single Parquet file per day:
+The script writes two Parquet files per day, partitioned by UTC date:
 
 ```
 OUTPUT_DIR/
-└── date=YYYY-MM-DD/
-    └── part-00000.parquet
+  users/
+    date=YYYY-MM-DD/
+      part-00000.parquet
+  gpts/
+    date=YYYY-MM-DD/
+      part-00000.parquet
 ```
 
-Each row represents a workspace user with metrics aligned to the compliance reporting schema.
+The user dataset contains one row per workspace user with metrics aligned to the compliance reporting schema. The GPT dataset contains one row per GPT configuration with daily usage and unique messager counts.
